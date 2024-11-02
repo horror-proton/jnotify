@@ -6,8 +6,8 @@
 #include <dbus/dbus.h>
 #include <systemd/sd-journal.h>
 
-static int64_t notify_send(DBusConnection *db, const char *summary,
-                           const char *body, int urgency) {
+static int64_t notify_send(DBusConnection *db, uint32_t oldid,
+                           const char *summary, const char *body, int urgency) {
   DBusMessage *msg = dbus_message_new_method_call(
       "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
       "org.freedesktop.Notifications", "Notify");
@@ -15,11 +15,11 @@ static int64_t notify_send(DBusConnection *db, const char *summary,
   DBusMessageIter args;
   dbus_message_iter_init_append(msg, &args);
   {
-    char *app_name = "my_app";
+    char *app_name = "jnotify";
     dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &app_name);
   }
   {
-    dbus_uint32_t id = 0;
+    dbus_uint32_t id = oldid;
     dbus_message_iter_append_basic(&args, DBUS_TYPE_UINT32, &id);
   }
   {
@@ -89,6 +89,7 @@ static int64_t notify_send(DBusConnection *db, const char *summary,
   if (dbus_error_is_set(&err)) {
     printf("Error: %s\n", err.message);
     dbus_error_free(&err);
+    dbus_message_unref(res);
     return -1;
   }
   dbus_uint32_t id = 0;
@@ -215,6 +216,142 @@ static void markup_escape(char *str, size_t str_len, char *dst,
   free(info); // TODO: make info static
 }
 
+struct online_user_info {
+  struct online_user_info *next;
+  uint32_t uid;
+  char *username;
+  char *object_path;
+  char *runtime_path;
+};
+
+struct online_user_info *g_online_users = NULL;
+
+static void online_user_info_free_one(struct online_user_info *u) {
+  free(u->username);
+  free(u->object_path);
+  free(u->runtime_path);
+  free(u);
+}
+
+static int sys_add_match(DBusConnection *sys) {
+  DBusError err;
+  dbus_error_init(&err);
+
+  dbus_bus_add_match(sys,
+                     "type='signal'"
+                     ",interface='org.freedesktop.login1.Manager'"
+                     ",path='/org/freedesktop/login1'",
+                     &err);
+  dbus_connection_flush(sys);
+  if (dbus_error_is_set(&err)) {
+    printf("Error: %s\n", err.message);
+    dbus_error_free(&err);
+    return -1;
+  }
+  return 0;
+}
+
+static int parse_list_users_result(DBusMessage *m /*a(uso)*/) {
+  DBusMessageIter iter;
+  dbus_message_iter_init(m, &iter); // a
+
+  // TODO: what if array is empty?
+  DBusMessageIter elem;
+  dbus_message_iter_recurse(&iter, &elem); // r
+
+  struct online_user_info *new_head = NULL;
+
+  // foreach user
+  for (;;) {
+    if (dbus_message_iter_get_arg_type(&elem) != DBUS_TYPE_STRUCT)
+      break; // array is empty?
+
+    DBusMessageIter member;
+    dbus_message_iter_recurse(&elem, &member);
+
+    dbus_uint32_t uid = -1;
+    dbus_message_iter_get_basic(&member, &uid);
+
+    dbus_message_iter_next(&member);
+
+    char *username = NULL;
+    dbus_message_iter_get_basic(&member, &username);
+
+    dbus_message_iter_next(&member);
+
+    char *path = NULL;
+    dbus_message_iter_get_basic(&member, &path);
+
+    struct online_user_info *new_user = calloc(1, sizeof(*new_user));
+    new_user->uid = uid;
+    new_user->username = strdup(username);
+    new_user->object_path = strdup(path);
+    new_user->runtime_path = NULL;
+    new_user->next = new_head;
+    new_head = new_user;
+
+    if (!dbus_message_iter_next(&elem))
+      break;
+  }
+
+  struct online_user_info *tmp = g_online_users;
+  g_online_users = new_head;
+
+  for (struct online_user_info *u = tmp; u != NULL;) {
+    struct online_user_info *next = u->next;
+    online_user_info_free_one(u);
+    u = next;
+  }
+
+  return 0;
+}
+
+static int sys_dbus_list_user(DBusConnection *sys) {
+  DBusMessage *msg = dbus_message_new_method_call(
+      "org.freedesktop.login1", "/org/freedesktop/login1",
+      "org.freedesktop.login1.Manager", "ListUsers");
+
+  DBusError err;
+  dbus_error_init(&err);
+  DBusMessage *res =
+      dbus_connection_send_with_reply_and_block(sys, msg, -1, &err);
+  dbus_message_unref(msg);
+  if (dbus_error_is_set(&err)) {
+    printf("Error: %s\n", err.message);
+    dbus_error_free(&err);
+    dbus_message_unref(res);
+    return -1;
+  }
+
+  int ret = parse_list_users_result(res);
+  dbus_message_unref(res);
+  return ret;
+}
+
+static int sys_update_online_users(DBusConnection *sys, int timeout_ms) {
+  if (dbus_connection_read_write(sys, timeout_ms) != TRUE)
+    return -1;
+
+  int result = 0;
+  while (1) {
+    DBusMessage *msg = dbus_connection_pop_message(sys);
+    if (msg == NULL)
+      break;
+
+    // TODO: check source of signal
+    const char *member = dbus_message_get_member(msg);
+    if (strcmp(member, "SessionNew") == 0 ||
+        strcmp(member, "SessionRemoved") == 0)
+      result = 1;
+    dbus_message_unref(msg);
+  }
+
+  if (result == 1)
+    sys_dbus_list_user(sys);
+
+  return result;
+}
+
 int main() {
   sd_journal *j = NULL;
   int r = sd_journal_open(&j, SD_JOURNAL_LOCAL_ONLY);
@@ -239,6 +376,7 @@ int main() {
   sd_journal_previous(j);
 
   char escape_buf[256] = {};
+  int64_t msgid = 0;
 
   while (1) {
     while (sd_journal_next(j) > 0) {
@@ -265,7 +403,9 @@ int main() {
       if (sd_journal_get_data(j, "MESSAGE", &d, &l) == 0 && l > 8) {
         printf("%.*s\n", (int)l, (const char *)d);
         markup_escape((char *)d + 8, l - 8, escape_buf, sizeof(escape_buf) - 1);
-        notify_send(connection, id_buf, escape_buf, urgency_map(priority));
+        msgid = notify_send(connection, msgid, id_buf, escape_buf,
+                            urgency_map(priority));
+        msgid += 1;
       }
     }
     sd_journal_wait(j, (uint64_t)(100000));
