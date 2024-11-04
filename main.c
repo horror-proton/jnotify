@@ -2,12 +2,15 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #include <dbus/dbus.h>
 #include <systemd/sd-journal.h>
 
-static int64_t notify_send(DBusConnection *db, uint32_t oldid,
-                           const char *summary, const char *body, int urgency) {
+static int64_t do_notify_send(DBusConnection *db, uint32_t oldid,
+                              const char *summary, const char *body,
+                              int urgency) {
   DBusMessage *msg = dbus_message_new_method_call(
       "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
       "org.freedesktop.Notifications", "Notify");
@@ -89,7 +92,6 @@ static int64_t notify_send(DBusConnection *db, uint32_t oldid,
   if (dbus_error_is_set(&err)) {
     printf("Error: %s\n", err.message);
     dbus_error_free(&err);
-    dbus_message_unref(res);
     return -1;
   }
   dbus_uint32_t id = 0;
@@ -222,15 +224,22 @@ struct online_user_info {
   char *username;
   char *object_path;
   char *runtime_path;
+  DBusConnection *user_bus;
+  uint32_t last_notify_id;
 };
 
 struct online_user_info *g_online_users = NULL;
 
-static void online_user_info_free_one(struct online_user_info *u) {
+static struct online_user_info *
+online_user_info_free_one(struct online_user_info *u) {
+  struct online_user_info *next = u->next;
   free(u->username);
   free(u->object_path);
   free(u->runtime_path);
+  if (u->user_bus != NULL)
+    dbus_connection_unref(u->user_bus);
   free(u);
+  return next;
 }
 
 static int sys_add_match(DBusConnection *sys) {
@@ -251,6 +260,7 @@ static int sys_add_match(DBusConnection *sys) {
   return 0;
 }
 
+// parse dbus message rebuild g_online_users
 static int parse_list_users_result(DBusMessage *m /*a(uso)*/) {
   DBusMessageIter iter;
   dbus_message_iter_init(m, &iter); // a
@@ -282,11 +292,15 @@ static int parse_list_users_result(DBusMessage *m /*a(uso)*/) {
     char *path = NULL;
     dbus_message_iter_get_basic(&member, &path);
 
+    // TODO: query via dbus /org/freedesktop/login1/user/uid
+    char rt[64] = {};
+    (void)snprintf(rt, sizeof(rt), "/run/user/%d", uid);
+
     struct online_user_info *new_user = calloc(1, sizeof(*new_user));
     new_user->uid = uid;
     new_user->username = strdup(username);
     new_user->object_path = strdup(path);
-    new_user->runtime_path = NULL;
+    new_user->runtime_path = strdup(rt);
     new_user->next = new_head;
     new_head = new_user;
 
@@ -297,10 +311,9 @@ static int parse_list_users_result(DBusMessage *m /*a(uso)*/) {
   struct online_user_info *tmp = g_online_users;
   g_online_users = new_head;
 
+  // free old list
   for (struct online_user_info *u = tmp; u != NULL;) {
-    struct online_user_info *next = u->next;
-    online_user_info_free_one(u);
-    u = next;
+    u = online_user_info_free_one(u);
   }
 
   return 0;
@@ -328,7 +341,7 @@ static int sys_dbus_list_user(DBusConnection *sys) {
   return ret;
 }
 
-static int sys_update_online_users(DBusConnection *sys, int timeout_ms) {
+static int sys_try_update_online_users(DBusConnection *sys, int timeout_ms) {
   if (dbus_connection_read_write(sys, timeout_ms) != TRUE)
     return -1;
 
@@ -352,6 +365,50 @@ static int sys_update_online_users(DBusConnection *sys, int timeout_ms) {
   return result;
 }
 
+static int g_run_as_root = 0;
+static uint32_t g_last_notify_id = 0;
+
+static int notify_user(DBusConnection *db, const char *summary,
+                       const char *body, int urgency) {
+
+  const int64_t msgid =
+      do_notify_send(db, g_last_notify_id + 1, summary, body, urgency);
+  if (msgid < 0)
+    return -1;
+  g_last_notify_id = msgid;
+  return 0;
+}
+
+static int notify_all_users(const char *summary, const char *body,
+                            int urgency) {
+  char address[64] = {};
+  for (struct online_user_info *u = g_online_users; u != NULL; u = u->next) {
+    if (u->user_bus == NULL) {
+      (void)snprintf(address, sizeof(address), "unix:path=%s/bus",
+                     u->runtime_path);
+      seteuid(u->uid);
+      DBusError err;
+      dbus_error_init(&err);
+      u->user_bus = dbus_connection_open(address, &err);
+      if (u->user_bus == NULL) {
+        printf("Error: %s\n", err.message);
+        continue;
+      }
+      if (dbus_bus_register(u->user_bus, &err) != TRUE) {
+        printf("Error: %s\n", err.message);
+        continue;
+      }
+    }
+    const int64_t res = do_notify_send(u->user_bus, u->last_notify_id + 1,
+                                       summary, body, urgency);
+    if (res < 0)
+      continue;
+    u->last_notify_id = res;
+  }
+  seteuid(0);
+  return 0;
+}
+
 int main() {
   sd_journal *j = NULL;
   int r = sd_journal_open(&j, SD_JOURNAL_LOCAL_ONLY);
@@ -360,9 +417,21 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  DBusConnection *system_bus = NULL;
+  DBusConnection *user_bus = NULL;
+
   DBusError err;
   dbus_error_init(&err);
-  DBusConnection *connection = dbus_bus_get(DBUS_BUS_SESSION, &err);
+
+  if (geteuid() == 0) {
+    g_run_as_root = 1;
+
+    system_bus = dbus_bus_get(DBUS_BUS_SYSTEM, &err);
+    sys_add_match(system_bus);
+    sys_dbus_list_user(system_bus);
+  } else {
+    user_bus = dbus_bus_get(DBUS_BUS_SESSION, &err);
+  }
 
   if (dbus_error_is_set(&err)) {
     printf("Error: %s\n", err.message);
@@ -376,7 +445,6 @@ int main() {
   sd_journal_previous(j);
 
   char escape_buf[256] = {};
-  int64_t msgid = 0;
 
   while (1) {
     while (sd_journal_next(j) > 0) {
@@ -403,11 +471,16 @@ int main() {
       if (sd_journal_get_data(j, "MESSAGE", &d, &l) == 0 && l > 8) {
         printf("%.*s\n", (int)l, (const char *)d);
         markup_escape((char *)d + 8, l - 8, escape_buf, sizeof(escape_buf) - 1);
-        msgid = notify_send(connection, msgid, id_buf, escape_buf,
-                            urgency_map(priority));
-        msgid += 1;
+
+        if (g_run_as_root) {
+          notify_all_users(id_buf, escape_buf, urgency_map(priority));
+        } else {
+          notify_user(user_bus, id_buf, escape_buf, urgency_map(priority));
+        }
       }
     }
     sd_journal_wait(j, (uint64_t)(100000));
+    if (g_run_as_root)
+      sys_try_update_online_users(system_bus, 0);
   }
 }
