@@ -225,6 +225,7 @@ struct online_user_info {
   char *object_path;
   char *runtime_path;
   DBusConnection *user_bus;
+  uint32_t notification_available;
   uint32_t last_notify_id;
 };
 
@@ -332,7 +333,6 @@ static int sys_dbus_list_user(DBusConnection *sys) {
   if (dbus_error_is_set(&err)) {
     printf("Error: %s\n", err.message);
     dbus_error_free(&err);
-    dbus_message_unref(res);
     return -1;
   }
 
@@ -383,6 +383,7 @@ static int notify_all_users(const char *summary, const char *body,
                             int urgency) {
   char address[64] = {};
   for (struct online_user_info *u = g_online_users; u != NULL; u = u->next) {
+    // create connection to user bus
     if (u->user_bus == NULL) {
       (void)snprintf(address, sizeof(address), "unix:path=%s/bus",
                      u->runtime_path);
@@ -399,6 +400,8 @@ static int notify_all_users(const char *summary, const char *body,
         continue;
       }
     }
+    if (u->notification_available == FALSE)
+      continue;
     const int64_t res = do_notify_send(u->user_bus, u->last_notify_id + 1,
                                        summary, body, urgency);
     if (res < 0)
@@ -407,6 +410,39 @@ static int notify_all_users(const char *summary, const char *body,
   }
   seteuid(0);
   return 0;
+}
+
+// TODO: use org.freedesktop.DBus.NameAcquired/NameLost signals
+static dbus_bool_t
+do_check_notification_availability(DBusConnection *user_bus) {
+  DBusMessage *msg = dbus_message_new_method_call(
+      "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+      "NameHasOwner");
+  DBusMessageIter args;
+  dbus_message_iter_init_append(msg, &args);
+  char *name = "org.freedesktop.Notifications";
+  dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &name);
+
+  DBusError err;
+  dbus_error_init(&err);
+  DBusMessage *ret =
+      dbus_connection_send_with_reply_and_block(user_bus, msg, -1, &err);
+  dbus_message_unref(msg);
+
+  if (dbus_error_is_set(&err)) {
+    printf("Error: %s\n", err.message);
+    dbus_error_free(&err);
+    return FALSE;
+  }
+
+  DBusMessageIter ret_args;
+  dbus_message_iter_init(ret, &ret_args);
+  dbus_bool_t has_owner = FALSE;
+  dbus_message_iter_get_basic(&ret_args, &has_owner);
+
+  dbus_message_unref(ret);
+
+  return has_owner;
 }
 
 int main() {
@@ -445,8 +481,25 @@ int main() {
   sd_journal_previous(j);
 
   char escape_buf[256] = {};
+  uint32_t user_notification_available = 0;
 
   while (1) {
+    if (g_run_as_root) {
+      sys_try_update_online_users(system_bus, 0);
+      for (struct online_user_info *u = g_online_users; u != NULL;
+           u = u->next) {
+        if (u->user_bus == NULL)
+          continue;
+        seteuid(u->uid);
+        u->notification_available =
+            do_check_notification_availability(u->user_bus);
+        seteuid(0);
+      }
+    } else {
+      user_notification_available =
+          do_check_notification_availability(user_bus);
+    }
+
     while (sd_journal_next(j) > 0) {
       const void *d = NULL;
       size_t l = 0;
@@ -472,15 +525,14 @@ int main() {
         printf("%.*s\n", (int)l, (const char *)d);
         markup_escape((char *)d + 8, l - 8, escape_buf, sizeof(escape_buf) - 1);
 
+        // if notification is not available, do not activate it
         if (g_run_as_root) {
           notify_all_users(id_buf, escape_buf, urgency_map(priority));
-        } else {
+        } else if (user_notification_available) {
           notify_user(user_bus, id_buf, escape_buf, urgency_map(priority));
         }
       }
     }
     sd_journal_wait(j, (uint64_t)(100000));
-    if (g_run_as_root)
-      sys_try_update_online_users(system_bus, 0);
   }
 }
