@@ -15,6 +15,8 @@ static int64_t do_notify_send(DBusConnection *db, uint32_t oldid,
       "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
       "org.freedesktop.Notifications", "Notify");
 
+  dbus_message_set_auto_start(msg, FALSE);
+
   DBusMessageIter args;
   dbus_message_iter_init_append(msg, &args);
   {
@@ -225,7 +227,7 @@ struct online_user_info {
   char *object_path;
   char *runtime_path;
   DBusConnection *user_bus;
-  uint32_t notification_available;
+  // uint32_t notification_available;
   uint32_t last_notify_id;
 };
 
@@ -400,8 +402,8 @@ static int notify_all_users(const char *summary, const char *body,
         continue;
       }
     }
-    if (u->notification_available == FALSE)
-      continue;
+    // if (u->notification_available == FALSE)
+    //   continue;
     const int64_t res = do_notify_send(u->user_bus, u->last_notify_id + 1,
                                        summary, body, urgency);
     if (res < 0)
@@ -413,6 +415,7 @@ static int notify_all_users(const char *summary, const char *body,
 }
 
 // TODO: use org.freedesktop.DBus.NameAcquired/NameLost signals
+/*
 static dbus_bool_t
 do_check_notification_availability(DBusConnection *user_bus) {
   DBusMessage *msg = dbus_message_new_method_call(
@@ -444,6 +447,7 @@ do_check_notification_availability(DBusConnection *user_bus) {
 
   return has_owner;
 }
+*/
 
 int main() {
   sd_journal *j = NULL;
@@ -481,11 +485,12 @@ int main() {
   sd_journal_previous(j);
 
   char escape_buf[256] = {};
-  uint32_t user_notification_available = 0;
+  // uint32_t user_notification_available = 0;
 
   while (1) {
     if (g_run_as_root) {
       sys_try_update_online_users(system_bus, 0);
+      /*
       for (struct online_user_info *u = g_online_users; u != NULL;
            u = u->next) {
         if (u->user_bus == NULL)
@@ -495,9 +500,12 @@ int main() {
             do_check_notification_availability(u->user_bus);
         seteuid(0);
       }
+      */
     } else {
+      /*
       user_notification_available =
           do_check_notification_availability(user_bus);
+      */
     }
 
     while (sd_journal_next(j) > 0) {
@@ -528,7 +536,7 @@ int main() {
         // if notification is not available, do not activate it
         if (g_run_as_root) {
           notify_all_users(id_buf, escape_buf, urgency_map(priority));
-        } else if (user_notification_available) {
+        } else /* if (user_notification_available) */ {
           notify_user(user_bus, id_buf, escape_buf, urgency_map(priority));
         }
       }
